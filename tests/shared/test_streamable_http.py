@@ -250,7 +250,7 @@ def create_app(is_json_response_enabled=False, event_store: EventStore | None = 
     return app
 
 
-def run_server(port: int, is_json_response_enabled=False, event_store: EventStore | None = None) -> None:
+def create_transport(is_json_response_enabled=False, event_store: EventStore | None = None) -> httpx.ASGITransport:
     """Run the test server.
 
     Args:
@@ -260,27 +260,34 @@ def run_server(port: int, is_json_response_enabled=False, event_store: EventStor
     """
 
     app = create_app(is_json_response_enabled, event_store)
-    # Configure server
-    config = uvicorn.Config(
-        app=app,
-        host="127.0.0.1",
-        port=port,
-        log_level="info",
-        limit_concurrency=10,
-        timeout_keep_alive=5,
-        access_log=False,
-    )
-
-    # Start the server
-    server = uvicorn.Server(config=config)
-
-    # This is important to catch exceptions and prevent test hangs
+    ## This shall run instead, the server should not run for tests.
+    ## It is mocked with ASGITransport
     try:
-        server.run()
+       return httpx.ASGITransport(app=app)
     except Exception:
         import traceback
-
         traceback.print_exc()
+
+    # # Configure server
+    # config = uvicorn.Config(
+    #     app=app,
+    #     host="127.0.0.1",
+    #     port=port,
+    #     log_level="info",
+    #     limit_concurrency=10,
+    #     timeout_keep_alive=5,
+    #     access_log=False,
+    # )
+    #
+    # # Start the server
+    # server = uvicorn.Server(config=config)
+    #
+    # # This is important to catch exceptions and prevent test hangs
+    # try:
+    #     server.run()
+    # except Exception:
+    #     import traceback
+    #     traceback.print_exc()
 
 
 # Test fixtures - using same approach as SSE tests
@@ -303,6 +310,13 @@ def json_server_port() -> int:
 @pytest.fixture
 def basic_server(basic_server_port: int) -> Generator[None, None, None]:
     """Start a basic server."""
+
+    client = httpx.AsyncClient(transport=create_transport(basic_server_port), base_url="127.0.0.1") 
+    try:
+
+    finally:
+        client.close()
+
     proc = multiprocessing.Process(target=run_server, kwargs={"port": basic_server_port}, daemon=True)
     proc.start()
 
@@ -418,92 +432,116 @@ def json_server_url(json_server_port: int) -> str:
 
 
 # Basic request validation tests
-def test_accept_header_validation(basic_server, basic_server_url):
+@pytest.mark.anyio
+async def test_accept_header_validation(basic_server, basic_server_url):
     """Test that Accept header is properly validated."""
     # Test without Accept header
-    response = requests.post(
-        f"{basic_server_url}/mcp",
-        headers={"Content-Type": "application/json"},
-        json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
-    )
+    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
+        response = await client.post("/mcp", headers={"Content-Type":"application/json"}, json={"jsonrpc":"2.0", "method":"initialize", "id":1},)
+    
     assert response.status_code == 406
     assert "Not Acceptable" in response.text
 
+    # response = requests.post(
+    #     f"{basic_server_url}/mcp",
+    #     headers={"Content-Type": "application/json"},
+    #     json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
+    # )
+    # assert response.status_code == 406
+    # assert "Not Acceptable" in response.text
 
-def test_content_type_validation(basic_server, basic_server_url):
+
+@pytest.mark.anyio
+async def test_content_type_validation(basic_server, basic_server_url):
     """Test that Content-Type header is properly validated."""
     # Test with incorrect Content-Type
-    response = requests.post(
-        f"{basic_server_url}/mcp",
-        headers={
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "text/plain",
-        },
-        data="This is not JSON",
-    )
+    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
+        response = await client.post("/mcp", headers={"Accept":"application/json, text/event-stream", "Content-Type": "text/plain",}, data="This is not JSON",)
+    
+    # response = requests.post(
+    #     f"{basic_server_url}/mcp",
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "text/plain",
+    #     },
+    #     data="This is not JSON",
+    # )
 
     assert response.status_code == 400
     assert "Invalid Content-Type" in response.text
 
 
-def test_json_validation(basic_server, basic_server_url):
+@pytest.mark.asyncio
+async def test_json_validation(basic_server, basic_server_url):
     """Test that JSON content is properly validated."""
     # Test with invalid JSON
-    response = requests.post(
-        f"{basic_server_url}/mcp",
-        headers={
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-        },
-        data="this is not valid json",
-    )
+    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
+        response = await client.post("/mcp", headers={"Accept":"application/json, text/event-stream", "Content-Type": "application/json",}, data="this is not valid json",)
+    # response = requests.post(
+    #     f"{basic_server_url}/mcp",
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #     },
+    #     data="this is not valid json",
+    # )
     assert response.status_code == 400
     assert "Parse error" in response.text
 
 
-def test_json_parsing(basic_server, basic_server_url):
+@pytest.mark.asyncio
+async def test_json_parsing(basic_server, basic_server_url):
     """Test that JSON content is properly parse."""
     # Test with valid JSON but invalid JSON-RPC
-    response = requests.post(
-        f"{basic_server_url}/mcp",
-        headers={
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-        },
-        json={"foo": "bar"},
-    )
+    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client: 
+        response = await client.post("/mcp", headers={"Accept":"application/json, text/event-stream", "Content-Type": "application/json",}, json={"foo": "bar"},)
+    # response = requests.post(
+    # response = requests.post(
+    #     f"{basic_server_url}/mcp",
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #     },
+    #     json={"foo": "bar"},
+    # )
     assert response.status_code == 400
     assert "Validation error" in response.text
 
 
-def test_method_not_allowed(basic_server, basic_server_url):
+@pytest.mark.asyncio
+async def test_method_not_allowed(basic_server, basic_server_url):
     """Test that unsupported HTTP methods are rejected."""
     # Test with unsupported method (PUT)
-    response = requests.put(
-        f"{basic_server_url}/mcp",
-        headers={
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-        },
-        json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
-    )
+    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
+        response = await client.put("/mcp", headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}, json={"jsonrpc":"2.0", "method":"initialize", "id":1},)
+    # response = requests.put(
+    #     f"{basic_server_url}/mcp",
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #     },
+    #     json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
+    # )
     assert response.status_code == 405
     assert "Method Not Allowed" in response.text
 
 
-def test_session_validation(basic_server, basic_server_url):
+@pytest.mark.asyncio
+async def test_session_validation(basic_server, basic_server_url):
     """Test session ID validation."""
     # session_id not used directly in this test
 
     # Test without session ID
-    response = requests.post(
-        f"{basic_server_url}/mcp",
-        headers={
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-        },
-        json={"jsonrpc": "2.0", "method": "list_tools", "id": 1},
-    )
+    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
+        response = await client.post("/mcp", headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json",}, json={"jsonrpc": "2.0", "method":"list_tools", "id":1},)
+    # response = requests.post(
+    #     f"{basic_server_url}/mcp",
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #     },
+    #     json={"jsonrpc": "2.0", "method": "list_tools", "id": 1},
+    # )
     assert response.status_code == 400
     assert "Missing session ID" in response.text
 
@@ -566,16 +604,19 @@ def test_streamable_http_transport_init_validation():
         StreamableHTTPServerTransport(mcp_session_id="test\n")
 
 
-def test_session_termination(basic_server, basic_server_url):
+@pytest.mark.anyio
+async def test_session_termination(basic_server, basic_server_url):
     """Test session termination via DELETE and subsequent request handling."""
-    response = requests.post(
-        f"{basic_server_url}/mcp",
-        headers={
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-        },
-        json=INIT_REQUEST,
-    )
+    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
+        response = await client.post("/mcp", headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json",}, json=INIT_REQUEST,)
+    # response = requests.post(
+    #     f"{basic_server_url}/mcp",
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #     },
+    #     json=INIT_REQUEST,
+    # )
     assert response.status_code == 200
 
     # Extract negotiated protocol version from SSE response
@@ -583,40 +624,47 @@ def test_session_termination(basic_server, basic_server_url):
 
     # Now terminate the session
     session_id = response.headers.get(MCP_SESSION_ID_HEADER)
-    response = requests.delete(
-        f"{basic_server_url}/mcp",
-        headers={
-            MCP_SESSION_ID_HEADER: session_id,
-            MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
-        },
-    )
+    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
+        response = await client.delete("/mcp", headers={MCP_SESSION_ID_HEADER: session_id, MCP_PROTOCOL_VERSION_HEADER: negotiated_version,},)
+    # response = requests.delete(
+    #     f"{basic_server_url}/mcp",
+    #     headers={
+    #         MCP_SESSION_ID_HEADER: session_id,
+    #         MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
+    #     },
+    # )
     assert response.status_code == 200
 
     # Try to use the terminated session
-    response = requests.post(
-        f"{basic_server_url}/mcp",
-        headers={
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-            MCP_SESSION_ID_HEADER: session_id,
-        },
-        json={"jsonrpc": "2.0", "method": "ping", "id": 2},
-    )
+    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
+        response = await client.post("/mcp", headers={"Accept":"application/json, text/event-stream", "Content-Type": "application/json", MCP_SESSION_ID_HEADER: session_id,},json={"jsonrpc":"2.0", "method":"ping", "id":2},)
+    # response = requests.post(
+    #     f"{basic_server_url}/mcp",
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #         MCP_SESSION_ID_HEADER: session_id,
+    #     },
+    #     json={"jsonrpc": "2.0", "method": "ping", "id": 2},
+    # )
     assert response.status_code == 404
     assert "Session has been terminated" in response.text
 
 
-def test_response(basic_server, basic_server_url):
+@pytest.mark.anyio
+async def test_response(basic_server, basic_server_url):
     """Test response handling for a valid request."""
     mcp_url = f"{basic_server_url}/mcp"
-    response = requests.post(
-        mcp_url,
-        headers={
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-        },
-        json=INIT_REQUEST,
-    )
+    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
+        response = await client.post("/mcp", headers={"Accept":"application/json, text/event-stream", "Content-Type": "application/json",}, json=INIT_REQUEST)
+    # response = requests.post(
+    #     mcp_url,
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #     },
+    #     json=INIT_REQUEST,
+    # )
     assert response.status_code == 200
 
     # Extract negotiated protocol version from SSE response
@@ -626,6 +674,7 @@ def test_response(basic_server, basic_server_url):
     session_id = response.headers.get(MCP_SESSION_ID_HEADER)
 
     # Try to use the session with proper headers
+
     tools_response = requests.post(
         mcp_url,
         headers={
