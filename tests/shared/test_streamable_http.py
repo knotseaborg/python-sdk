@@ -5,17 +5,16 @@ Contains tests for both server and client sides of the StreamableHTTP transport.
 """
 
 import json
-import multiprocessing
 import socket
 import time
 from collections.abc import Generator
-from typing import Any
+from typing import Any, no_type_check
 
 import anyio
 import httpx
 import pytest
 import requests
-import uvicorn
+from asgi_lifespan import LifespanManager
 from pydantic import AnyUrl
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -250,44 +249,59 @@ def create_app(is_json_response_enabled=False, event_store: EventStore | None = 
     return app
 
 
-def create_transport(is_json_response_enabled=False, event_store: EventStore | None = None) -> httpx.ASGITransport:
-    """Run the test server.
+#
+# @pytest.fixture
+# async def http_basic_transport(
+#     is_json_response_enabled=False, event_store: EventStore | None = None
+# ) -> httpx.ASGITransport:
+#     """Run the test server.
+#
+#     Args:
+#         port: Port to listen on.
+#         is_json_response_enabled: If True, use JSON responses instead of SSE streams.
+#         yield
+#     """
+#     app = create_app(is_json_response_enabled, event_store)
+#
+#     async with LifespanManager(app) as _:
+#         yield httpx.ASGITransport(app=app)
 
-    Args:
-        port: Port to listen on.
-        is_json_response_enabled: If True, use JSON responses instead of SSE streams.
-        event_store: Optional event store for testing resumability.
-    """
+# # Client-specific fixtures
+# @pytest.fixture
+# async def http_basic_client_factory():
+#     """Create test client factory matching the SSE test pattern."""
+#
+#     app = create_app()
+#     async with LifespanManager(app):
+#         def _client(**kwargs):
+#             return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), **kwargs)
+#
+#         yield _client
 
-    app = create_app(is_json_response_enabled, event_store)
-    ## This shall run instead, the server should not run for tests.
-    ## It is mocked with ASGITransport
-    try:
-       return httpx.ASGITransport(app=app)
-    except Exception:
-        import traceback
-        traceback.print_exc()
 
-    # # Configure server
-    # config = uvicorn.Config(
-    #     app=app,
-    #     host="127.0.0.1",
-    #     port=port,
-    #     log_level="info",
-    #     limit_concurrency=10,
-    #     timeout_keep_alive=5,
-    #     access_log=False,
-    # )
-    #
-    # # Start the server
-    # server = uvicorn.Server(config=config)
-    #
-    # # This is important to catch exceptions and prevent test hangs
-    # try:
-    #     server.run()
-    # except Exception:
-    #     import traceback
-    #     traceback.print_exc()
+@pytest.fixture
+async def http_basic_client():
+    """Create test client for basic server."""
+    app = create_app()
+    async with LifespanManager(app) as _:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app)) as client:
+            yield client
+
+
+@pytest.fixture
+async def http_json_client():
+    """Create test client for json response server."""
+    app = create_app(is_json_response_enabled=True)
+    async with LifespanManager(app) as _:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app)) as client:
+            yield client
+
+
+# @pytest.fixture
+# async def http_event_client(event_store):
+#     """Create test client."""
+#     async with httpx.AsyncClient(transport=http_transport_factory(event_store=event_store)) as client:
+#         yield client
 
 
 # Test fixtures - using same approach as SSE tests
@@ -307,38 +321,38 @@ def json_server_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture
-def basic_server(basic_server_port: int) -> Generator[None, None, None]:
-    """Start a basic server."""
-
-    client = httpx.AsyncClient(transport=create_transport(basic_server_port), base_url="127.0.0.1") 
-    try:
-
-    finally:
-        client.close()
-
-    proc = multiprocessing.Process(target=run_server, kwargs={"port": basic_server_port}, daemon=True)
-    proc.start()
-
-    # Wait for server to be running
-    max_attempts = 20
-    attempt = 0
-    while attempt < max_attempts:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect(("127.0.0.1", basic_server_port))
-                break
-        except ConnectionRefusedError:
-            time.sleep(0.1)
-            attempt += 1
-    else:
-        raise RuntimeError(f"Server failed to start after {max_attempts} attempts")
-
-    yield
-
-    # Clean up
-    proc.kill()
-    proc.join(timeout=2)
+# @pytest.fixture:
+# def basic_server(basic_server_port: int) -> Generator[None, None, None]:
+#     """Start a basic server."""
+#
+#     client = httpx.AsyncClient(transport=create_transport(), base_url="127.0.0.1")
+#     try:
+#
+#     finally:
+#         client.close()
+#
+#     proc = multiprocessing.Process(target=run_server, kwargs={"port": basic_server_port}, daemon=True)
+#     proc.start()
+#
+#     # Wait for server to be running
+#     max_attempts = 20
+#     attempt = 0
+#     while attempt < max_attempts:
+#         try:
+#             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+#                 s.connect(("127.0.0.1", basic_server_port))
+#                 break
+#         except ConnectionRefusedError:
+#             time.sleep(0.1)
+#             attempt += 1
+#     else:
+#         raise RuntimeError(f"Server failed to start after {max_attempts} attempts")
+#
+#     yield
+#
+#     # Clean up
+#     proc.kill()
+#     proc.join(timeout=2)
 
 
 @pytest.fixture
@@ -355,68 +369,68 @@ def event_server_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture
-def event_server(
-    event_server_port: int, event_store: SimpleEventStore
-) -> Generator[tuple[SimpleEventStore, str], None, None]:
-    """Start a server with event store enabled."""
-    proc = multiprocessing.Process(
-        target=run_server,
-        kwargs={"port": event_server_port, "event_store": event_store},
-        daemon=True,
-    )
-    proc.start()
+# @pytest.fixture
+# def event_server(
+#     event_server_port: int, event_store: SimpleEventStore
+# ) -> Generator[tuple[SimpleEventStore, str], None, None]:
+#     """Start a server with event store enabled."""
+#     proc = multiprocessing.Process(
+#         target=run_server,
+#         kwargs={"port": event_server_port, "event_store": event_store},
+#         daemon=True,
+#     )
+#     proc.start()
+#
+#     # Wait for server to be running
+#     max_attempts = 20
+#     attempt = 0
+#     while attempt < max_attempts:
+#         try:
+#             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+#                 s.connect(("127.0.0.1", event_server_port))
+#                 break
+#         except ConnectionRefusedError:
+#             time.sleep(0.1)
+#             attempt += 1
+#     else:
+#         raise RuntimeError(f"Server failed to start after {max_attempts} attempts")
+#
+#     yield event_store, f"http://127.0.0.1:{event_server_port}"
+#
+#     # Clean up
+#     proc.kill()
+#     proc.join(timeout=2)
 
-    # Wait for server to be running
-    max_attempts = 20
-    attempt = 0
-    while attempt < max_attempts:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect(("127.0.0.1", event_server_port))
-                break
-        except ConnectionRefusedError:
-            time.sleep(0.1)
-            attempt += 1
-    else:
-        raise RuntimeError(f"Server failed to start after {max_attempts} attempts")
 
-    yield event_store, f"http://127.0.0.1:{event_server_port}"
-
-    # Clean up
-    proc.kill()
-    proc.join(timeout=2)
-
-
-@pytest.fixture
-def json_response_server(json_server_port: int) -> Generator[None, None, None]:
-    """Start a server with JSON response enabled."""
-    proc = multiprocessing.Process(
-        target=run_server,
-        kwargs={"port": json_server_port, "is_json_response_enabled": True},
-        daemon=True,
-    )
-    proc.start()
-
-    # Wait for server to be running
-    max_attempts = 20
-    attempt = 0
-    while attempt < max_attempts:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect(("127.0.0.1", json_server_port))
-                break
-        except ConnectionRefusedError:
-            time.sleep(0.1)
-            attempt += 1
-    else:
-        raise RuntimeError(f"Server failed to start after {max_attempts} attempts")
-
-    yield
-
-    # Clean up
-    proc.kill()
-    proc.join(timeout=2)
+# @pytest.fixture
+# def json_response_server(json_server_port: int) -> Generator[None, None, None]:
+#     """Start a server with JSON response enabled."""
+#     proc = multiprocessing.Process(
+#         target=run_server,
+#         kwargs={"port": json_server_port, "is_json_response_enabled": True},
+#         daemon=True,
+#     )
+#     proc.start()
+#
+#     # Wait for server to be running
+#     max_attempts = 20
+#     attempt = 0
+#     while attempt < max_attempts:
+#         try:
+#             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+#                 s.connect(("127.0.0.1", json_server_port))
+#                 break
+#         except ConnectionRefusedError:
+#             time.sleep(0.1)
+#             attempt += 1
+#     else:
+#         raise RuntimeError(f"Server failed to start after {max_attempts} attempts")
+#
+#     yield
+#
+#     # Clean up
+#     proc.kill()
+#     proc.join(timeout=2)
 
 
 @pytest.fixture
@@ -431,19 +445,27 @@ def json_server_url(json_server_port: int) -> str:
     return f"http://127.0.0.1:{json_server_port}"
 
 
+@pytest.fixture
+def event_server_url(event_server_port) -> str:
+    """Get URL for event server"""
+    return f"http://127.0.0.1:{event_server_port}"
+
+
 # Basic request validation tests
 @pytest.mark.anyio
-async def test_accept_header_validation(basic_server, basic_server_url):
+async def test_accept_header_validation(http_basic_client, basic_server_url):
     """Test that Accept header is properly validated."""
     # Test without Accept header
-    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
-        response = await client.post("/mcp", headers={"Content-Type":"application/json"}, json={"jsonrpc":"2.0", "method":"initialize", "id":1},)
-    
+    response = await http_basic_client.post(
+        f"{basic_server_url}/mcp/",
+        headers={"Content-Type": "application/json"},
+        json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
+    )
     assert response.status_code == 406
     assert "Not Acceptable" in response.text
 
     # response = requests.post(
-    #     f"{basic_server_url}/mcp",
+    #     f"{basic_server_url}/mcp/",
     #     headers={"Content-Type": "application/json"},
     #     json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
     # )
@@ -452,14 +474,20 @@ async def test_accept_header_validation(basic_server, basic_server_url):
 
 
 @pytest.mark.anyio
-async def test_content_type_validation(basic_server, basic_server_url):
+async def test_content_type_validation(http_basic_client, basic_server_url):
     """Test that Content-Type header is properly validated."""
     # Test with incorrect Content-Type
-    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
-        response = await client.post("/mcp", headers={"Accept":"application/json, text/event-stream", "Content-Type": "text/plain",}, data="This is not JSON",)
-    
+    response = await http_basic_client.post(
+        f"{basic_server_url}/mcp/",
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "text/plain",
+        },
+        data="This is not JSON",
+    )
+
     # response = requests.post(
-    #     f"{basic_server_url}/mcp",
+    #     f"{basic_server_url}/mcp/",
     #     headers={
     #         "Accept": "application/json, text/event-stream",
     #         "Content-Type": "text/plain",
@@ -471,14 +499,20 @@ async def test_content_type_validation(basic_server, basic_server_url):
     assert "Invalid Content-Type" in response.text
 
 
-@pytest.mark.asyncio
-async def test_json_validation(basic_server, basic_server_url):
+@pytest.mark.anyio
+async def test_json_validation(http_basic_client, basic_server_url):
     """Test that JSON content is properly validated."""
     # Test with invalid JSON
-    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
-        response = await client.post("/mcp", headers={"Accept":"application/json, text/event-stream", "Content-Type": "application/json",}, data="this is not valid json",)
+    response = await http_basic_client.post(
+        f"{basic_server_url}/mcp/",
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+        },
+        data="this is not valid json",
+    )
     # response = requests.post(
-    #     f"{basic_server_url}/mcp",
+    #     f"{basic_server_url}/mcp/",
     #     headers={
     #         "Accept": "application/json, text/event-stream",
     #         "Content-Type": "application/json",
@@ -489,15 +523,21 @@ async def test_json_validation(basic_server, basic_server_url):
     assert "Parse error" in response.text
 
 
-@pytest.mark.asyncio
-async def test_json_parsing(basic_server, basic_server_url):
+@pytest.mark.anyio
+async def test_json_parsing(http_basic_client, basic_server_url):
     """Test that JSON content is properly parse."""
     # Test with valid JSON but invalid JSON-RPC
-    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client: 
-        response = await client.post("/mcp", headers={"Accept":"application/json, text/event-stream", "Content-Type": "application/json",}, json={"foo": "bar"},)
+    response = await http_basic_client.post(
+        f"{basic_server_url}/mcp/",
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+        },
+        json={"foo": "bar"},
+    )
     # response = requests.post(
     # response = requests.post(
-    #     f"{basic_server_url}/mcp",
+    #     f"{basic_server_url}/mcp/",
     #     headers={
     #         "Accept": "application/json, text/event-stream",
     #         "Content-Type": "application/json",
@@ -508,14 +548,17 @@ async def test_json_parsing(basic_server, basic_server_url):
     assert "Validation error" in response.text
 
 
-@pytest.mark.asyncio
-async def test_method_not_allowed(basic_server, basic_server_url):
+@pytest.mark.anyio
+async def test_method_not_allowed(http_basic_client, basic_server_url):
     """Test that unsupported HTTP methods are rejected."""
     # Test with unsupported method (PUT)
-    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
-        response = await client.put("/mcp", headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}, json={"jsonrpc":"2.0", "method":"initialize", "id":1},)
+    response = await http_basic_client.put(
+        f"{basic_server_url}/mcp/",
+        headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"},
+        json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
+    )
     # response = requests.put(
-    #     f"{basic_server_url}/mcp",
+    #     f"{basic_server_url}/mcp/",
     #     headers={
     #         "Accept": "application/json, text/event-stream",
     #         "Content-Type": "application/json",
@@ -526,16 +569,21 @@ async def test_method_not_allowed(basic_server, basic_server_url):
     assert "Method Not Allowed" in response.text
 
 
-@pytest.mark.asyncio
-async def test_session_validation(basic_server, basic_server_url):
+@pytest.mark.anyio
+async def test_session_validation(http_basic_client, basic_server_url):
     """Test session ID validation."""
     # session_id not used directly in this test
-
     # Test without session ID
-    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
-        response = await client.post("/mcp", headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json",}, json={"jsonrpc": "2.0", "method":"list_tools", "id":1},)
+    response = await http_basic_client.post(
+        f"{basic_server_url}/mcp/",
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+        },
+        json={"jsonrpc": "2.0", "method": "list_tools", "id": 1},
+    )
     # response = requests.post(
-    #     f"{basic_server_url}/mcp",
+    #     f"{basic_server_url}/mcp/",
     #     headers={
     #         "Accept": "application/json, text/event-stream",
     #         "Content-Type": "application/json",
@@ -605,12 +653,19 @@ def test_streamable_http_transport_init_validation():
 
 
 @pytest.mark.anyio
-async def test_session_termination(basic_server, basic_server_url):
+async def test_session_termination(http_basic_client, basic_server_url):
     """Test session termination via DELETE and subsequent request handling."""
-    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
-        response = await client.post("/mcp", headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json",}, json=INIT_REQUEST,)
+    mcp_url = f"{basic_server_url}/mcp/"
+    response = await http_basic_client.post(
+        mcp_url,
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+        },
+        json=INIT_REQUEST,
+    )
     # response = requests.post(
-    #     f"{basic_server_url}/mcp",
+    #     f"{basic_server_url}/mcp/",
     #     headers={
     #         "Accept": "application/json, text/event-stream",
     #         "Content-Type": "application/json",
@@ -622,12 +677,19 @@ async def test_session_termination(basic_server, basic_server_url):
     # Extract negotiated protocol version from SSE response
     negotiated_version = extract_protocol_version_from_sse(response)
 
-    # Now terminate the session
+    # Get the session id to terminate the session
     session_id = response.headers.get(MCP_SESSION_ID_HEADER)
-    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
-        response = await client.delete("/mcp", headers={MCP_SESSION_ID_HEADER: session_id, MCP_PROTOCOL_VERSION_HEADER: negotiated_version,},)
+
+    # Now terminate the session
+    response = await http_basic_client.delete(
+        mcp_url,
+        headers={
+            MCP_SESSION_ID_HEADER: session_id,
+            MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
+        },
+    )
     # response = requests.delete(
-    #     f"{basic_server_url}/mcp",
+    #     f"{basic_server_url}/mcp/",
     #     headers={
     #         MCP_SESSION_ID_HEADER: session_id,
     #         MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
@@ -636,10 +698,17 @@ async def test_session_termination(basic_server, basic_server_url):
     assert response.status_code == 200
 
     # Try to use the terminated session
-    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
-        response = await client.post("/mcp", headers={"Accept":"application/json, text/event-stream", "Content-Type": "application/json", MCP_SESSION_ID_HEADER: session_id,},json={"jsonrpc":"2.0", "method":"ping", "id":2},)
+    response = await http_basic_client.post(
+        mcp_url,
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            MCP_SESSION_ID_HEADER: session_id,
+        },
+        json={"jsonrpc": "2.0", "method": "ping", "id": 2},
+    )
     # response = requests.post(
-    #     f"{basic_server_url}/mcp",
+    #     f"{basic_server_url}/mcp/",
     #     headers={
     #         "Accept": "application/json, text/event-stream",
     #         "Content-Type": "application/json",
@@ -652,11 +721,17 @@ async def test_session_termination(basic_server, basic_server_url):
 
 
 @pytest.mark.anyio
-async def test_response(basic_server, basic_server_url):
+async def test_response(http_basic_client, basic_server_url):
     """Test response handling for a valid request."""
-    mcp_url = f"{basic_server_url}/mcp"
-    async with httpx.AsyncClient(transport=create_transport(), base_url=basic_server_url) as client:
-        response = await client.post("/mcp", headers={"Accept":"application/json, text/event-stream", "Content-Type": "application/json",}, json=INIT_REQUEST)
+    mcp_url = f"{basic_server_url}/mcp/"
+    response = await http_basic_client.post(
+        mcp_url,
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+        },
+        json=INIT_REQUEST,
+    )
     # response = requests.post(
     #     mcp_url,
     #     headers={
@@ -674,9 +749,9 @@ async def test_response(basic_server, basic_server_url):
     session_id = response.headers.get(MCP_SESSION_ID_HEADER)
 
     # Try to use the session with proper headers
-
-    tools_response = requests.post(
-        mcp_url,
+    async with http_basic_client.stream(
+        method="POST",
+        url=mcp_url,
         headers={
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
@@ -684,17 +759,31 @@ async def test_response(basic_server, basic_server_url):
             MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
         },
         json={"jsonrpc": "2.0", "method": "tools/list", "id": "tools-1"},
-        stream=True,
-    )
-    assert tools_response.status_code == 200
-    assert tools_response.headers.get("Content-Type") == "text/event-stream"
+    ) as tools_response:
+        assert tools_response.status_code == 200
+        assert tools_response.headers.get("Content-Type") == "text/event-stream"
+
+    #
+    # tools_response = requests.post(
+    #     mcp_url,
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #         MCP_SESSION_ID_HEADER: session_id,  # Use the session ID we got earlier
+    #         MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
+    #     },
+    #     json={"jsonrpc": "2.0", "method": "tools/list", "id": "tools-1"},
+    #     stream=True,
+    # )
+    # assert tools_response.status_code == 200
+    # assert tools_response.headers.get("Content-Type") == "text/event-stream"
 
 
-def test_json_response(json_response_server, json_server_url):
+@pytest.mark.anyio
+async def test_json_response(http_json_client, json_server_url):
     """Test response handling when is_json_response_enabled is True."""
-    mcp_url = f"{json_server_url}/mcp"
-    response = requests.post(
-        mcp_url,
+    response = await http_json_client.post(
+        f"{json_server_url}/mcp/",
         headers={
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
@@ -704,12 +793,25 @@ def test_json_response(json_response_server, json_server_url):
     assert response.status_code == 200
     assert response.headers.get("Content-Type") == "application/json"
 
+    # cp_url = f"{json_server_url}/mcp/"
+    # response = requests.post(
+    #     mcp_url,
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #     },
+    #     json=INIT_REQUEST,
+    # )
+    # assert response.status_code == 200
+    # assert response.headers.get("Content-Type") == "application/json"
 
-def test_get_sse_stream(basic_server, basic_server_url):
+
+@pytest.mark.anyio
+async def test_get_sse_stream(http_basic_client, basic_server_url):
     """Test establishing an SSE stream via GET request."""
     # First, we need to initialize a session
-    mcp_url = f"{basic_server_url}/mcp"
-    init_response = requests.post(
+    mcp_url = f"{basic_server_url}/mcp/"
+    init_response = await http_basic_client.post(
         mcp_url,
         headers={
             "Accept": "application/json, text/event-stream",
@@ -717,6 +819,15 @@ def test_get_sse_stream(basic_server, basic_server_url):
         },
         json=INIT_REQUEST,
     )
+
+    # init_response = requests.post(
+    #     mcp_url,
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #     },
+    #     json=INIT_REQUEST,
+    # )
     assert init_response.status_code == 200
 
     # Get the session ID
@@ -734,49 +845,81 @@ def test_get_sse_stream(basic_server, basic_server_url):
     negotiated_version = init_data["result"]["protocolVersion"]
 
     # Now attempt to establish an SSE stream via GET
-    get_response = requests.get(
-        mcp_url,
+    async with http_basic_client.stream(
+        method="GET",
+        url=mcp_url,
         headers={
             "Accept": "text/event-stream",
             MCP_SESSION_ID_HEADER: session_id,
             MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
         },
-        stream=True,
-    )
+    ) as get_response:
+        assert get_response.status_code == 200
+        assert get_response.headers.get("Content-Type") == "text/event-stream"
+
+    # get_response = requests.get(
+    #     mcp_url,
+    #     headers={
+    #         "Accept": "text/event-stream",
+    #         MCP_SESSION_ID_HEADER: session_id,
+    #         MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
+    #     },
+    #     stream=True,
+    # )
 
     # Verify we got a successful response with the right content type
-    assert get_response.status_code == 200
-    assert get_response.headers.get("Content-Type") == "text/event-stream"
+    # assert get_response.status_code == 200
+    # assert get_response.headers.get("Content-Type") == "text/event-stream"
 
     # Test that a second GET request gets rejected (only one stream allowed)
-    second_get = requests.get(
-        mcp_url,
+    async with http_basic_client.stream(
+        method="GET",
+        url=mcp_url,
         headers={
             "Accept": "text/event-stream",
             MCP_SESSION_ID_HEADER: session_id,
             MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
         },
-        stream=True,
-    )
+    ) as second_get:
+        assert second_get.status_code == 409
+
+    # second_get = requests.get(
+    #     mcp_url,
+    #     headers={
+    #         "Accept": "text/event-stream",
+    #         MCP_SESSION_ID_HEADER: session_id,
+    #         MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
+    #     },
+    #     stream=True,
+    # )
 
     # Should get CONFLICT (409) since there's already a stream
     # Note: This might fail if the first stream fully closed before this runs,
     # but generally it should work in the test environment where it runs quickly
-    assert second_get.status_code == 409
+    # assert second_get.status_code == 409
 
 
-def test_get_validation(basic_server, basic_server_url):
+@pytest.mark.anyio
+async def test_get_validation(http_basic_client, basic_server_url):
     """Test validation for GET requests."""
     # First, we need to initialize a session
-    mcp_url = f"{basic_server_url}/mcp"
-    init_response = requests.post(
-        mcp_url,
+    mcp_url = f"{basic_server_url}/mcp/"
+    init_response = await http_basic_client.post(
+        url=mcp_url,
         headers={
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
         },
         json=INIT_REQUEST,
     )
+    # init_response = requests.post(
+    #     mcp_url,
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #     },
+    #     json=INIT_REQUEST,
+    # )
     assert init_response.status_code == 200
 
     # Get the session ID
@@ -794,19 +937,30 @@ def test_get_validation(basic_server, basic_server_url):
     negotiated_version = init_data["result"]["protocolVersion"]
 
     # Test without Accept header
-    response = requests.get(
-        mcp_url,
+    async with http_basic_client.stream(
+        method="GET",
+        url=mcp_url,
         headers={
             MCP_SESSION_ID_HEADER: session_id,
             MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
         },
-        stream=True,
-    )
-    assert response.status_code == 406
-    assert "Not Acceptable" in response.text
+    ) as response:
+        assert response.status_code == 406
+        assert "Not Acceptable" in response.text
+
+    # response = requests.get(
+    #     mcp_url,
+    #     headers={
+    #         MCP_SESSION_ID_HEADER: session_id,
+    #         MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
+    #     },
+    #     stream=True,
+    # ):with
+    # assert response.status_code == 406
+    # assert "Not Acceptable" in response.text
 
     # Test with wrong Accept header
-    response = requests.get(
+    response = await http_basic_client.get(
         mcp_url,
         headers={
             "Accept": "application/json",
@@ -817,19 +971,62 @@ def test_get_validation(basic_server, basic_server_url):
     assert response.status_code == 406
     assert "Not Acceptable" in response.text
 
+    # response = requests.get(
+    #     mcp_url,
+    #     headers={
+    #         "Accept": "application/json",
+    #         MCP_SESSION_ID_HEADER: session_id,
+    #         MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
+    #     },
+    # )
+    # assert response.status_code == 406
+    # assert "Not Acceptable" in response.text
+
 
 # Client-specific fixtures
 @pytest.fixture
-async def http_client(basic_server, basic_server_url):
-    """Create test client matching the SSE test pattern."""
-    async with httpx.AsyncClient(base_url=basic_server_url) as client:
-        yield client
+async def http_basic_client_factory():
+    """Create test client factory matching the SSE test pattern."""
+
+    app = create_app()
+    async with LifespanManager(app):
+
+        def _client(**kwargs):
+            return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), **kwargs)
+
+        yield _client
 
 
 @pytest.fixture
-async def initialized_client_session(basic_server, basic_server_url):
+async def http_json_client_factory():
+    """Create test client factory matching the SSE test pattern."""
+
+    app = create_app(is_json_response_enabled=True)
+    async with LifespanManager(app):
+
+        def _client(**kwargs):
+            return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), **kwargs)
+
+    yield _client
+
+
+@pytest.fixture
+async def http_event_client_factory(event_store):
+    """Create test client factory matching the SSE test pattern."""
+
+    app = create_app(event_store=event_store)
+    async with LifespanManager(app):
+
+        def _client(**kwargs):
+            return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), **kwargs)
+
+        yield _client
+
+
+@pytest.fixture
+async def initialized_client_session(http_basic_client_factory, basic_server_url):
     """Create initialized StreamableHTTP client session."""
-    async with streamablehttp_client(f"{basic_server_url}/mcp") as (
+    async with streamablehttp_client(f"{basic_server_url}/mcp/", httpx_client_factory=http_basic_client_factory) as (
         read_stream,
         write_stream,
         _,
@@ -843,9 +1040,9 @@ async def initialized_client_session(basic_server, basic_server_url):
 
 
 @pytest.mark.anyio
-async def test_streamablehttp_client_basic_connection(basic_server, basic_server_url):
+async def test_streamablehttp_client_basic_connection(http_basic_client_factory, basic_server_url):
     """Test basic client connection with initialization."""
-    async with streamablehttp_client(f"{basic_server_url}/mcp") as (
+    async with streamablehttp_client(f"{basic_server_url}/mcp/", httpx_client_factory=http_basic_client_factory) as (
         read_stream,
         write_stream,
         _,
@@ -863,6 +1060,7 @@ async def test_streamablehttp_client_basic_connection(basic_server, basic_server
 @pytest.mark.anyio
 async def test_streamablehttp_client_resource_read(initialized_client_session):
     """Test client resource read functionality."""
+    # response = initialized_client_session.read_resource()
     response = await initialized_client_session.read_resource(uri=AnyUrl("foobar://test-resource"))
     assert len(response.contents) == 1
     assert response.contents[0].uri == AnyUrl("foobar://test-resource")
@@ -894,9 +1092,9 @@ async def test_streamablehttp_client_error_handling(initialized_client_session):
 
 
 @pytest.mark.anyio
-async def test_streamablehttp_client_session_persistence(basic_server, basic_server_url):
+async def test_streamablehttp_client_session_persistence(http_basic_client_factory, basic_server_url):
     """Test that session ID persists across requests."""
-    async with streamablehttp_client(f"{basic_server_url}/mcp") as (
+    async with streamablehttp_client(f"{basic_server_url}/mcp/", httpx_client_factory=http_basic_client_factory) as (
         read_stream,
         write_stream,
         _,
@@ -922,9 +1120,9 @@ async def test_streamablehttp_client_session_persistence(basic_server, basic_ser
 
 
 @pytest.mark.anyio
-async def test_streamablehttp_client_json_response(json_response_server, json_server_url):
+async def test_streamablehttp_client_json_response(http_json_client_factory, json_server_url):
     """Test client with JSON response mode."""
-    async with streamablehttp_client(f"{json_server_url}/mcp") as (
+    async with streamablehttp_client(f"{json_server_url}/mcp/", httpx_client_factory=http_json_client_factory) as (
         read_stream,
         write_stream,
         _,
@@ -950,7 +1148,7 @@ async def test_streamablehttp_client_json_response(json_response_server, json_se
 
 
 @pytest.mark.anyio
-async def test_streamablehttp_client_get_stream(basic_server, basic_server_url):
+async def test_streamablehttp_client_get_stream(http_basic_client_factory, basic_server_url):
     """Test GET stream functionality for server-initiated messages."""
     import mcp.types as types
     from mcp.shared.session import RequestResponder
@@ -964,7 +1162,7 @@ async def test_streamablehttp_client_get_stream(basic_server, basic_server_url):
         if isinstance(message, types.ServerNotification):
             notifications_received.append(message)
 
-    async with streamablehttp_client(f"{basic_server_url}/mcp") as (
+    async with streamablehttp_client(f"{basic_server_url}/mcp/", httpx_client_factory=http_basic_client_factory) as (
         read_stream,
         write_stream,
         _,
@@ -991,13 +1189,13 @@ async def test_streamablehttp_client_get_stream(basic_server, basic_server_url):
 
 
 @pytest.mark.anyio
-async def test_streamablehttp_client_session_termination(basic_server, basic_server_url):
+async def test_streamablehttp_client_session_termination(http_basic_client_factory, basic_server_url):
     """Test client session termination functionality."""
 
     captured_session_id = None
 
     # Create the streamablehttp_client with a custom httpx client to capture headers
-    async with streamablehttp_client(f"{basic_server_url}/mcp") as (
+    async with streamablehttp_client(f"{basic_server_url}/mcp/", httpx_client_factory=http_basic_client_factory) as (
         read_stream,
         write_stream,
         get_session_id,
@@ -1017,7 +1215,9 @@ async def test_streamablehttp_client_session_termination(basic_server, basic_ser
     if captured_session_id:
         headers[MCP_SESSION_ID_HEADER] = captured_session_id
 
-    async with streamablehttp_client(f"{basic_server_url}/mcp", headers=headers) as (
+    async with streamablehttp_client(
+        f"{basic_server_url}/mcp/", headers=headers, httpx_client_factory=http_basic_client_factory
+    ) as (
         read_stream,
         write_stream,
         _,
@@ -1032,7 +1232,7 @@ async def test_streamablehttp_client_session_termination(basic_server, basic_ser
 
 
 @pytest.mark.anyio
-async def test_streamablehttp_client_session_termination_204(basic_server, basic_server_url, monkeypatch):
+async def test_streamablehttp_client_session_termination_204(http_basic_client_factory, basic_server_url, monkeypatch):
     """Test client session termination functionality with a 204 response.
 
     This test patches the httpx client to return a 204 response for DELETEs.
@@ -1061,7 +1261,7 @@ async def test_streamablehttp_client_session_termination_204(basic_server, basic
     captured_session_id = None
 
     # Create the streamablehttp_client with a custom httpx client to capture headers
-    async with streamablehttp_client(f"{basic_server_url}/mcp") as (
+    async with streamablehttp_client(f"{basic_server_url}/mcp/", httpx_client_factory=http_basic_client_factory) as (
         read_stream,
         write_stream,
         get_session_id,
@@ -1081,7 +1281,9 @@ async def test_streamablehttp_client_session_termination_204(basic_server, basic
     if captured_session_id:
         headers[MCP_SESSION_ID_HEADER] = captured_session_id
 
-    async with streamablehttp_client(f"{basic_server_url}/mcp", headers=headers) as (
+    async with streamablehttp_client(
+        f"{basic_server_url}/mcp/", headers=headers, httpx_client_factory=http_basic_client_factory
+    ) as (
         read_stream,
         write_stream,
         _,
@@ -1096,9 +1298,8 @@ async def test_streamablehttp_client_session_termination_204(basic_server, basic
 
 
 @pytest.mark.anyio
-async def test_streamablehttp_client_resumption(event_server):
+async def test_streamablehttp_client_resumption(http_event_client_factory, event_server_url):
     """Test client session to resume a long running tool."""
-    _, server_url = event_server
 
     # Variables to track the state
     captured_session_id = None
@@ -1123,7 +1324,9 @@ async def test_streamablehttp_client_resumption(event_server):
         captured_resumption_token = token
 
     # First, start the client session and begin the long-running tool
-    async with streamablehttp_client(f"{server_url}/mcp", terminate_on_close=False) as (
+    async with streamablehttp_client(
+        f"{event_server_url}/mcp/", terminate_on_close=False, httpx_client_factory=http_event_client_factory
+    ) as (
         read_stream,
         write_stream,
         get_session_id,
@@ -1175,7 +1378,9 @@ async def test_streamablehttp_client_resumption(event_server):
     if captured_protocol_version:
         headers[MCP_PROTOCOL_VERSION_HEADER] = captured_protocol_version
 
-    async with streamablehttp_client(f"{server_url}/mcp", headers=headers) as (
+    async with streamablehttp_client(
+        f"{event_server_url}/mcp/", headers=headers, httpx_client_factory=http_event_client_factory
+    ) as (
         read_stream,
         write_stream,
         _,
@@ -1219,7 +1424,7 @@ async def test_streamablehttp_client_resumption(event_server):
 
 
 @pytest.mark.anyio
-async def test_streamablehttp_server_sampling(basic_server, basic_server_url):
+async def test_streamablehttp_server_sampling(http_basic_client_factory, basic_server_url):
     """Test server-initiated sampling request through streamable HTTP transport."""
     print("Testing server sampling...")
     # Variable to track if sampling callback was invoked
@@ -1247,7 +1452,7 @@ async def test_streamablehttp_server_sampling(basic_server, basic_server_url):
         )
 
     # Create client with sampling callback
-    async with streamablehttp_client(f"{basic_server_url}/mcp") as (
+    async with streamablehttp_client(f"{basic_server_url}/mcp/", httpx_client_factory=http_basic_client_factory) as (
         read_stream,
         write_stream,
         _,
@@ -1342,7 +1547,7 @@ class ContextAwareServerTest(Server):
 
 
 # Server runner for context-aware testing
-def run_context_aware_server(port: int):
+def context_aware_transport() -> httpx.ASGITransport:
     """Run the context-aware test server."""
     server = ContextAwareServerTest()
 
@@ -1360,47 +1565,80 @@ def run_context_aware_server(port: int):
         lifespan=lambda app: session_manager.run(),
     )
 
-    server_instance = uvicorn.Server(
-        config=uvicorn.Config(
-            app=app,
-            host="127.0.0.1",
-            port=port,
-            log_level="error",
-        )
-    )
-    server_instance.run()
+    return httpx.ASGITransport(app=app)
 
 
 @pytest.fixture
-def context_aware_server(basic_server_port: int) -> Generator[None, None, None]:
-    """Start the context-aware server in a separate process."""
-    proc = multiprocessing.Process(target=run_context_aware_server, args=(basic_server_port,), daemon=True)
-    proc.start()
+async def context_aware_client_factory():
+    """Create test client."""
 
-    # Wait for server to be running
-    max_attempts = 20
-    attempt = 0
-    while attempt < max_attempts:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect(("127.0.0.1", basic_server_port))
-                break
-        except ConnectionRefusedError:
-            time.sleep(0.1)
-            attempt += 1
-    else:
-        raise RuntimeError(f"Context-aware server failed to start after {max_attempts} attempts")
+    def _client():
+        return httpx.AsyncClient(transport=context_aware_transport())
 
-    yield
+    return _client
 
-    proc.kill()
-    proc.join(timeout=2)
-    if proc.is_alive():
-        print("Context-aware server process failed to terminate")
+
+# # Server runner for context-aware testing
+# def run_context_aware_server(port: int):
+#     """Run the context-aware test server."""
+#     server = ContextAwareServerTest()
+#
+#     session_manager = StreamableHTTPSessionManager(
+#         app=server,
+#         event_store=None,
+#         json_response=False,
+#     )
+#
+#     app = Starlette(
+#         debug=True,
+#         routes=[
+#             Mount("/mcp", app=session_manager.handle_request),
+#         ],
+#         lifespan=lambda app: session_manager.run(),
+#     )
+#
+#     server_instance = uvicorn.Server(
+#         config=uvicorn.Config(
+#             app=app,
+#             host="127.0.0.1",
+#             port=port,
+#             log_level="error",
+#         )
+#     )
+#     server_instance.run()
+
+
+# @pytest.fixture
+# def context_aware_server(basic_server_port: int) -> Generator[None, None, None]:
+#     """Start the context-aware server in a separate process."""
+#     proc = multiprocessing.Process(target=run_context_aware_server, args=(basic_server_port,), daemon=True)
+#     proc.start()
+#
+#     # Wait for server to be running
+#     max_attempts = 20
+#     attempt = 0
+#     while attempt < max_attempts:
+#         try:
+#             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+#                 s.connect(("127.0.0.1", basic_server_port))
+#                 break
+#         except ConnectionRefusedError:
+#             time.sleep(0.1)
+#             attempt += 1
+#     else:
+#         raise RuntimeError(f"Context-aware server failed to start after {max_attempts} attempts")
+#
+#     yield
+#
+#     proc.kill()
+#     proc.join(timeout=2)
+#     if proc.is_alive():
+#         print("Context-aware server process failed to terminate")
+#
 
 
 @pytest.mark.anyio
-async def test_streamablehttp_request_context_propagation(context_aware_server: None, basic_server_url: str) -> None:
+async def test_streamablehttp_request_context_propagation(context_aware_client_factory, basic_server_url: str) -> None:
     """Test that request context is properly propagated through StreamableHTTP."""
     custom_headers = {
         "Authorization": "Bearer test-token",
@@ -1408,7 +1646,9 @@ async def test_streamablehttp_request_context_propagation(context_aware_server: 
         "X-Trace-Id": "trace-123",
     }
 
-    async with streamablehttp_client(f"{basic_server_url}/mcp", headers=custom_headers) as (
+    async with streamablehttp_client(
+        f"{basic_server_url}/mcp/", headers=custom_headers, httpx_client_factory=context_aware_client_factory
+    ) as (
         read_stream,
         write_stream,
         _,
@@ -1433,7 +1673,7 @@ async def test_streamablehttp_request_context_propagation(context_aware_server: 
 
 
 @pytest.mark.anyio
-async def test_streamablehttp_request_context_isolation(context_aware_server: None, basic_server_url: str) -> None:
+async def test_streamablehttp_request_context_isolation(context_aware_client_factory, basic_server_url: str) -> None:
     """Test that request contexts are isolated between StreamableHTTP clients."""
     contexts = []
 
@@ -1445,7 +1685,9 @@ async def test_streamablehttp_request_context_isolation(context_aware_server: No
             "Authorization": f"Bearer token-{i}",
         }
 
-        async with streamablehttp_client(f"{basic_server_url}/mcp", headers=headers) as (read_stream, write_stream, _):
+        async with streamablehttp_client(
+            f"{basic_server_url}/mcp/", headers=headers, httpx_client_factory=context_aware_client_factory
+        ) as (read_stream, write_stream, _):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
 
@@ -1467,9 +1709,9 @@ async def test_streamablehttp_request_context_isolation(context_aware_server: No
 
 
 @pytest.mark.anyio
-async def test_client_includes_protocol_version_header_after_init(context_aware_server, basic_server_url):
+async def test_client_includes_protocol_version_header_after_init(context_aware_client_factory, basic_server_url):
     """Test that client includes mcp-protocol-version header after initialization."""
-    async with streamablehttp_client(f"{basic_server_url}/mcp") as (
+    async with streamablehttp_client(f"{basic_server_url}/mcp/", httpx_client_factory=context_aware_client_factory) as (
         read_stream,
         write_stream,
         _,
@@ -1491,23 +1733,40 @@ async def test_client_includes_protocol_version_header_after_init(context_aware_
             assert headers_data[MCP_PROTOCOL_VERSION_HEADER] == negotiated_version
 
 
-def test_server_validates_protocol_version_header(basic_server, basic_server_url):
+@pytest.mark.anyio
+async def test_server_validates_protocol_version_header(http_basic_client, basic_server_url):
     """Test that server returns 400 Bad Request version if header unsupported or invalid."""
     # First initialize a session to get a valid session ID
-    init_response = requests.post(
-        f"{basic_server_url}/mcp",
+    mcp_url = f"{basic_server_url}/mcp/"
+    init_response = await http_basic_client.post(
+        mcp_url,
         headers={
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
         },
         json=INIT_REQUEST,
     )
+
     assert init_response.status_code == 200
     session_id = init_response.headers.get(MCP_SESSION_ID_HEADER)
 
+    # Extract valid protocol version to test with valid protocol request (should succeed)
+    negotiated_version = extract_protocol_version_from_sse(init_response)
+
+    # init_response = requests.post(
+    #     f"{basic_server_url}/mcp/",
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #     },
+    #     json=INIT_REQUEST,
+    # )
+    # assert init_response.status_code == 200
+    # session_id = init_response.headers.get(MCP_SESSION_ID_HEADER)
+
     # Test request with invalid protocol version (should fail)
-    response = requests.post(
-        f"{basic_server_url}/mcp",
+    response = await http_basic_client.post(
+        mcp_url,
         headers={
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
@@ -1519,9 +1778,22 @@ def test_server_validates_protocol_version_header(basic_server, basic_server_url
     assert response.status_code == 400
     assert MCP_PROTOCOL_VERSION_HEADER in response.text or "protocol version" in response.text.lower()
 
+    # response = requests.post(
+    #     f"{basic_server_url}/mcp/",
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #         MCP_SESSION_ID_HEADER: session_id,
+    #         MCP_PROTOCOL_VERSION_HEADER: "invalid-version",
+    #     },
+    #     json={"jsonrpc": "2.0", "method": "tools/list", "id": "test-2"},
+    # )
+    # assert response.status_code == 400
+    # assert MCP_PROTOCOL_VERSION_HEADER in response.text or "protocol version" in response.text.lower()
+
     # Test request with unsupported protocol version (should fail)
-    response = requests.post(
-        f"{basic_server_url}/mcp",
+    response = await http_basic_client.post(
+        mcp_url,
         headers={
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
@@ -1533,11 +1805,24 @@ def test_server_validates_protocol_version_header(basic_server, basic_server_url
     assert response.status_code == 400
     assert MCP_PROTOCOL_VERSION_HEADER in response.text or "protocol version" in response.text.lower()
 
-    # Test request with valid protocol version (should succeed)
-    negotiated_version = extract_protocol_version_from_sse(init_response)
+    # response = requests.post(
+    #     f"{basic_server_url}/mcp/",
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #         MCP_SESSION_ID_HEADER: session_id,
+    #         MCP_PROTOCOL_VERSION_HEADER: "1999-01-01",  # Very old unsupported version
+    #     },
+    #     json={"jsonrpc": "2.0", "method": "tools/list", "id": "test-3"},
+    # )
+    # assert response.status_code == 400
+    # assert MCP_PROTOCOL_VERSION_HEADER in response.text or "protocol version" in response.text.lower()
 
-    response = requests.post(
-        f"{basic_server_url}/mcp",
+    ## Test request with valid protocol version (should succeed)
+    # negotiated_version = extract_protocol_version_from_sse(init_response)
+
+    response = await http_basic_client.post(
+        mcp_url,
         headers={
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
@@ -1548,12 +1833,26 @@ def test_server_validates_protocol_version_header(basic_server, basic_server_url
     )
     assert response.status_code == 200
 
+    # response = requests.post(
+    #     f"{basic_server_url}/mcp/",
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #         MCP_SESSION_ID_HEADER: session_id,
+    #         MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
+    #     },
+    #     json={"jsonrpc": "2.0", "method": "tools/list", "id": "test-4"},
+    # )
+    # assert response.status_code == 200
 
-def test_server_backwards_compatibility_no_protocol_version(basic_server, basic_server_url):
+
+@pytest.mark.anyio
+async def test_server_backwards_compatibility_no_protocol_version(http_basic_client, basic_server_url):
     """Test server accepts requests without protocol version header."""
     # First initialize a session to get a valid session ID
-    init_response = requests.post(
-        f"{basic_server_url}/mcp",
+    mcp_url = f"{basic_server_url}/mcp/"
+    init_response = await http_basic_client.post(
+        mcp_url,
         headers={
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
@@ -1563,29 +1862,56 @@ def test_server_backwards_compatibility_no_protocol_version(basic_server, basic_
     assert init_response.status_code == 200
     session_id = init_response.headers.get(MCP_SESSION_ID_HEADER)
 
+    # init_response = requests.post(
+    #     f"{basic_server_url}/mcp/",
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #     },
+    #     json=INIT_REQUEST,
+    # )
+    # assert init_response.status_code == 200
+    # session_id = init_response.headers.get(MCP_SESSION_ID_HEADER)
+
     # Test request without mcp-protocol-version header (backwards compatibility)
-    response = requests.post(
-        f"{basic_server_url}/mcp",
+    async with http_basic_client.stream(
+        method="POST",
+        url=mcp_url,
         headers={
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
             MCP_SESSION_ID_HEADER: session_id,
         },
         json={"jsonrpc": "2.0", "method": "tools/list", "id": "test-backwards-compat"},
-        stream=True,
-    )
-    assert response.status_code == 200  # Should succeed for backwards compatibility
-    assert response.headers.get("Content-Type") == "text/event-stream"
+    ) as response:
+        assert response.status_code == 200  # Should succeed for backwards compatibility
+        assert response.headers.get("Content-Type") == "text/event-stream"
+
+    # response = requests.post(
+    #     f"{basic_server_url}/mcp/",
+    #     headers={
+    #         "Accept": "application/json, text/event-stream",
+    #         "Content-Type": "application/json",
+    #         MCP_SESSION_ID_HEADER: session_id,
+    #     },
+    #     json={"jsonrpc": "2.0", "method": "tools/list", "id": "test-backwards-compat"},
+    #     stream=True,
+    # )
+    # assert response.status_code == 200  # Should succeed for backwards compatibility
+    # assert response.headers.get("Content-Type") == "text/event-stream"
+    #
 
 
 @pytest.mark.anyio
-async def test_client_crash_handled(basic_server, basic_server_url):
+async def test_client_crash_handled(http_basic_client_factory, basic_server_url):
     """Test that cases where the client crashes are handled gracefully."""
 
     # Simulate bad client that crashes after init
     async def bad_client():
         """Client that triggers ClosedResourceError"""
-        async with streamablehttp_client(f"{basic_server_url}/mcp") as (
+        async with streamablehttp_client(
+            f"{basic_server_url}/mcp/", httpx_client_factory=http_basic_client_factory
+        ) as (
             read_stream,
             write_stream,
             _,
@@ -1603,7 +1929,7 @@ async def test_client_crash_handled(basic_server, basic_server_url):
         await anyio.sleep(0.1)
 
     # Try a good client, it should still be able to connect and list tools
-    async with streamablehttp_client(f"{basic_server_url}/mcp") as (
+    async with streamablehttp_client(f"{basic_server_url}/mcp/", httpx_client_factory=http_basic_client_factory) as (
         read_stream,
         write_stream,
         _,

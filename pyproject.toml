@@ -57,6 +57,7 @@ dev = [
     "pytest-examples>=0.0.14",
     "pytest-pretty>=1.2.0",
     "inline-snapshot>=0.23.0",
+    "asgi-lifespan>=2.1.0",
 ]
 docs = [
     "mkdocs>=1.6.1",
